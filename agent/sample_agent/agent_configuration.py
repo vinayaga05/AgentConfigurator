@@ -32,32 +32,46 @@ if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from qdrant_client.models import Distance, VectorParams, PointStruct
-from src.backend.qdrant.dependencies import get_qdrant_client
-from src.backend.api.v1.knowledge_base.service.qdrant import QdrantService
-from src.backend.qdrant.embedding import EmbeddingService
-from src.backend.qdrant.helper import EmbeddingModelManager
-from src.backend.helpers import get_ai_provider_key
-from src.backend.api.v1.knowledge_base.helpers import utc_now
-from src.backend.environment import Config
-from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.memory import InMemorySaver
 import uuid
 
-# Import LangGraph state and graph components
-from src.backend.agent_configuration.state import AgentConfigState
-from src.backend.agent_configuration.graph import compile_agent_config_graph
-from src.backend.agent_configuration.nodes import _calculate_eta
-
-# Import token estimation utilities
-from src.backend.graph.v1.history import estimate_tokens, count_messages_tokens
+# Optional imports from backend modules (may not exist in all project structures)
+try:
+    from src.backend.qdrant.dependencies import get_qdrant_client
+    from src.backend.api.v1.knowledge_base.service.qdrant import QdrantService
+    from src.backend.qdrant.embedding import EmbeddingService
+    from src.backend.qdrant.helper import EmbeddingModelManager
+    from src.backend.helpers import get_ai_provider_key
+    from src.backend.api.v1.knowledge_base.helpers import utc_now
+    from src.backend.environment import Config
+    # Import LangGraph state and graph components
+    from src.backend.agent_configuration.state import AgentConfigState
+    from src.backend.agent_configuration.graph import compile_agent_config_graph
+    from src.backend.agent_configuration.nodes import _calculate_eta
+    # Import token estimation utilities
+    from src.backend.graph.v1.history import estimate_tokens, count_messages_tokens
+    BACKEND_MODULES_AVAILABLE = True
+except ImportError:
+    # Backend modules not available - define stubs or None
+    get_qdrant_client = None
+    QdrantService = None
+    EmbeddingService = None
+    EmbeddingModelManager = None
+    get_ai_provider_key = None
+    utc_now = None
+    Config = None
+    AgentConfigState = None
+    compile_agent_config_graph = None
+    _calculate_eta = None
+    estimate_tokens = None
+    count_messages_tokens = None
+    BACKEND_MODULES_AVAILABLE = False
 
 # Set socket timeout to prevent hanging imports
 socket.setdefaulttimeout(10)
 
 # Load environment variables
 load_dotenv()
-
-GOOGLE_API_KEY = "GOOGLE_API_KEY"
 
 # Configure logging to go to stderr
 logging.basicConfig(
@@ -244,6 +258,7 @@ class AgentConfigurationAssistant:
     def __init__(self, model="gemini-2.5-flash", thread_id: Optional[str] = None):
         """Initialize with Gemini model and optional thread_id for memory"""
         try:
+            GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
             # Configure Google Gemini (moved from module level to avoid import-time hangs)
             if GOOGLE_API_KEY:
                 try:
@@ -4512,7 +4527,8 @@ The agent now has a completely new role and may need different tools. Would you 
 
     def create_empty_state(self):
         """Create a completely empty AgentConfigState with no messages"""
-        from src.backend.agent_configuration.state import AgentConfigState
+        if not BACKEND_MODULES_AVAILABLE or AgentConfigState is None:
+            raise ImportError("AgentConfigState is not available. Backend modules are required for this functionality.")
         
         return AgentConfigState(
             messages=[],  # Empty messages list
