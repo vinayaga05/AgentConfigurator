@@ -50,7 +50,7 @@ bun run install:agent
 
 3. Set up your Google Gemini API key:
 ```bash
-echo 'GOOGLE_API_KEY=AIzaSyBHhIm8aZ4pkQZzZNsBMxHOCUn2ySSEbwI' > agent/.env
+echo 'GOOGLE_API_KEY=GOOGLE_API_KEY' > agent/.env
 ```
 
 4. Start the development server:

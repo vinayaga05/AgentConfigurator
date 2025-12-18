@@ -49,6 +49,7 @@ class AgentState(MessagesState):
     agent_config_assistant: Optional[Any] = None  # Type is Any to avoid import at module load time
     model_provider: str = MODEL_PROVIDER  # Model provider: "gemini" or "ollama"
     model_name: str = MODEL_NAME  # Model name for the selected provider
+    agent_config_state: Dict[str, Any] = {}  # Stores configuration workflow state
     # your_custom_agent_state: str = ""
 
 def _get_assistant_class():
@@ -372,6 +373,375 @@ async def generate_clarification_questions(analysis_result: str) -> str:
         return json.dumps(error_result)
 
 
+@tool
+async def configure_agent_complete(
+    user_input: str,
+    current_state_json: Optional[str] = None,
+    conversation_history_json: Optional[str] = None,
+    agent_id: Optional[str] = None
+) -> str:
+    """
+    Complete agent configuration workflow that handles the entire process from analysis to instruction generation.
+    
+    This tool intelligently manages the agent configuration workflow:
+    1. Checks current state (initial, analysis, clarification, tool_selection, instruction_generation, complete)
+    2. Analyzes user input with unrelated detection (handles greetings/off-topic)
+    3. Processes clarification answers if in clarification stage
+    4. Extracts tool categories from analysis
+    5. Searches and recommends tools from vector database
+    6. Generates comprehensive agent instruction
+    7. Supports instruction and tool modifications
+    
+    Args:
+        user_input: User's message describing what they want or answering questions
+        current_state_json: Optional JSON string with current configuration state
+        conversation_history_json: Optional JSON string with conversation history for context
+        agent_id: Optional agent UUID for database sync operations
+        
+    Returns:
+        JSON string with complete configuration result including stage, response_message, 
+        needs_clarification, questions, current_instruction, recommended_tools, etc.
+    """
+    try:
+        # Lazy import to avoid dependency issues
+        AgentConfigurationAssistant = _get_assistant_class()
+        model_name = os.getenv("MODEL_NAME", "gemini-2.5-flash")
+        assistant = AgentConfigurationAssistant(model=model_name)
+        
+        # Parse current state
+        current_state = {}
+        if current_state_json:
+            try:
+                current_state = json.loads(current_state_json) if isinstance(current_state_json, str) else current_state_json
+            except:
+                current_state = {}
+        
+        # Parse conversation history
+        conversation_history = []
+        if conversation_history_json:
+            try:
+                conversation_history = json.loads(conversation_history_json) if isinstance(conversation_history_json, str) else conversation_history_json
+            except:
+                conversation_history = []
+        
+        # Build full context for methods that need it
+        full_context = {
+            "conversation_history": conversation_history,
+            "accumulated_context": current_state.get("accumulated_context", ""),
+            "clarification_history": current_state.get("clarification_history", [])
+        }
+        
+        # Determine current stage
+        stage = current_state.get("stage", "initial")
+        current_instruction = current_state.get("current_instruction", {})
+        pending_questions = current_state.get("pending_questions", [])
+        previous_analysis = current_state.get("analysis_result", {})
+        agent_summary = current_state.get("agent_summary", {})
+        
+        # Initialize result structure
+        result = {
+            "stage": stage,
+            "response_message": "",
+            "needs_clarification": False,
+            "questions": [],
+            "is_unrelated": False,
+            "current_instruction": current_instruction,
+            "recommended_tools": current_state.get("recommended_tools", []),
+            "analysis_result": previous_analysis,
+            "agent_summary": agent_summary,
+            "success": True
+        }
+        
+        # STAGE 1: Initial or Requirement Analysis
+        if stage in ["initial", "requirement_analysis"]:
+            # Analyze agent requirements with unrelated detection
+            analysis_result = await assistant.analyze_agent_role_and_responsibility(
+                user_input,
+                streaming_events=None,  # No streaming in tool context
+                full_context=full_context
+            )
+            
+            # Check if unrelated input was detected
+            response_message = analysis_result.get("response_message", "")
+            if response_message:
+                # Unrelated input - return contextual response
+                result.update({
+                    "stage": "initial",
+                    "response_message": response_message,
+                    "is_unrelated": True,
+                    "analysis_result": analysis_result
+                })
+                return json.dumps(result, indent=2, default=str)
+            
+            # Extract analysis details
+            needs_clarification = analysis_result.get("needs_clarification", False)
+            questions = analysis_result.get("questions", [])
+            clarity_score = analysis_result.get("requirement_clarity_score", 0.0)
+            
+            # Build agent summary
+            agent_summary = {
+                "purpose": analysis_result.get("purpose", ""),
+                "role": analysis_result.get("role", ""),
+                "responsibility": analysis_result.get("responsibility", ""),
+                "core_responsibilities": analysis_result.get("core_responsibilities", []),
+                "expected_workflow": analysis_result.get("expected_workflow", []),
+                "analysis_summary": analysis_result.get("analysis_summary", "")
+            }
+            
+            if needs_clarification and questions:
+                # Need clarification - ask questions
+                summary_text = (
+                    f"**Agent Summary:**\n\n"
+                    f"**Role:** {agent_summary.get('role', 'N/A')}\n\n"
+                    f"**Responsibility:** {agent_summary.get('responsibility', 'N/A')}\n\n"
+                    f"{agent_summary.get('analysis_summary', '')}\n"
+                )
+                questions_text = "\n\n".join([f"**{i+1}.** {q.strip()}" for i, q in enumerate(questions)])
+                response_message = (
+                    f"{summary_text}\n\n"
+                    f"To configure this agent completely, I need some additional information:\n\n"
+                    f"{questions_text}\n\n"
+                    f"Please provide answers to these questions so I can proceed with the configuration.\n"
+                )
+                
+                result.update({
+                    "stage": "clarification",
+                    "response_message": response_message,
+                    "needs_clarification": True,
+                    "questions": questions,
+                    "analysis_result": analysis_result,
+                    "agent_summary": agent_summary
+                })
+            else:
+                # Clear requirements - proceed to tool selection
+                summary_text = (
+                    f"**Agent Summary:**\n\n"
+                    f"**Role:** {agent_summary.get('role', 'N/A')}\n\n"
+                    f"**Responsibility:** {agent_summary.get('responsibility', 'N/A')}\n\n"
+                    f"{agent_summary.get('analysis_summary', '')}\n\n"
+                    f"Great! I have all the information needed. Let me find the appropriate tools..."
+                )
+                
+                result.update({
+                    "stage": "tool_selection",
+                    "response_message": summary_text,
+                    "needs_clarification": False,
+                    "analysis_result": analysis_result,
+                    "agent_summary": agent_summary
+                })
+                
+                # Continue to tool selection (will be handled in next call or can be done here)
+                # For now, return state indicating ready for tool selection
+        
+        # STAGE 2: Clarification - Process user answers
+        elif stage == "clarification":
+            if not agent_summary:
+                agent_summary = previous_analysis
+            
+            if not pending_questions:
+                pending_questions = previous_analysis.get("questions", [])
+            
+            # Process clarification answers
+            answer_result = await assistant.get_answers_for_agent_role_questions(
+                user_input=user_input,
+                agent_summary=agent_summary,
+                questions_list=pending_questions,
+                streaming_events=None
+            )
+            
+            # Update agent summary with answers
+            updated_summary = answer_result.get("updated_agent_summary", agent_summary)
+            remaining_questions = answer_result.get("remaining_questions", [])
+            clarity_score = answer_result.get("clarity_score", 0.0)
+            still_needs_clarification = answer_result.get("needs_clarification", True)
+            
+            # Update agent summary
+            agent_summary = updated_summary
+            
+            if still_needs_clarification and remaining_questions:
+                # Still need more clarification
+                questions_text = "\n\n".join([f"**{i+1}.** {q.strip()}" for i, q in enumerate(remaining_questions)])
+                response_message = (
+                    f"Thank you for the information. I still need a few more details:\n\n"
+                    f"{questions_text}\n\n"
+                    f"Please provide answers to these remaining questions.\n"
+                )
+                
+                result.update({
+                    "stage": "clarification",
+                    "response_message": response_message,
+                    "needs_clarification": True,
+                    "questions": remaining_questions,
+                    "agent_summary": agent_summary,
+                    "analysis_result": {
+                        **previous_analysis,
+                        **updated_summary
+                    }
+                })
+            else:
+                # Clarification complete - proceed to tool selection
+                response_message = (
+                    f"Perfect! I have all the information I need. Let me find the appropriate tools for your agent...\n"
+                )
+                
+                result.update({
+                    "stage": "tool_selection",
+                    "response_message": response_message,
+                    "needs_clarification": False,
+                    "agent_summary": agent_summary,
+                    "analysis_result": {
+                        **previous_analysis,
+                        **updated_summary
+                    }
+                })
+        
+        # STAGE 3: Tool Selection - Extract categories and search tools
+        elif stage == "tool_selection":
+            # Extract tool categories from analysis
+            # Use the analysis result to build tool categories
+            if not agent_summary:
+                agent_summary = previous_analysis
+            
+            # Build tool categories from agent summary
+            tool_categories = {
+                "primary_categories": [],
+                "required_tools": [],
+                "keywords": [],
+                "search_queries": []
+            }
+            
+            # Extract from workflow and responsibilities
+            workflow = agent_summary.get("expected_workflow", [])
+            responsibilities = agent_summary.get("core_responsibilities", [])
+            
+            # Create search queries from workflow
+            if workflow:
+                tool_categories["search_queries"] = [
+                    {"query": step, "weight": 0.8} for step in workflow[:5]
+                ]
+            
+            # Search tools from vector DB
+            tools_result = assistant.get_tools_from_categories(
+                tool_categories,
+                limit=50,
+                user_input=user_input
+            )
+            
+            tools_list = tools_result.get("tools_list", [])
+            
+            if not tools_list:
+                result.update({
+                    "stage": "tool_selection",
+                    "response_message": "I couldn't find specific tools. Let me proceed with instruction generation based on the analysis.",
+                    "recommended_tools": []
+                })
+            else:
+                # Perform semantic search to rank tools
+                current_instruction_dict = {
+                    "role": agent_summary.get("role", ""),
+                    "responsibility": agent_summary.get("responsibility", ""),
+                    "process_steps": workflow
+                }
+                
+                semantic_result = await assistant.semantic_search_from_filtered_tools(
+                    user_input=user_input,
+                    current_instruction=current_instruction_dict,
+                    tools=tools_list,
+                    streaming_events=None,
+                    full_context=full_context
+                )
+                
+                recommended_tools = semantic_result.get("recommended_tools", [])
+                
+                result.update({
+                    "stage": "instruction_generation",
+                    "recommended_tools": recommended_tools,
+                    "response_message": f"Found {len(recommended_tools)} relevant tools. Generating agent instruction..."
+                })
+                
+                # Continue to instruction generation
+                stage = "instruction_generation"
+        
+        # STAGE 4: Instruction Generation
+        if stage == "instruction_generation" or (stage == "tool_selection" and result.get("recommended_tools")):
+            # Generate instruction from agent summary and tools
+            if not agent_summary:
+                agent_summary = previous_analysis
+            
+            recommended_tools = result.get("recommended_tools", [])
+            
+            # Build current instruction from agent summary
+            current_instruction_dict = {
+                "role": agent_summary.get("role", ""),
+                "responsibility": agent_summary.get("responsibility", ""),
+                "process_title": "Main Process",
+                "process_steps": agent_summary.get("expected_workflow", [])
+            }
+            
+            # Generate comprehensive instruction
+            instruction = await assistant.get_instruction(
+                current_instruction=current_instruction_dict,
+                recommended_tools=recommended_tools,
+                streaming_events=None,
+                message_type="agent_creation",
+                extracted_requirements=current_instruction_dict,
+                full_context=full_context
+            )
+            
+            # Convert to dict if needed
+            if hasattr(instruction, 'model_dump'):
+                instruction_dict = instruction.model_dump()
+            elif hasattr(instruction, 'dict'):
+                instruction_dict = instruction.dict()
+            else:
+                instruction_dict = instruction
+            
+            # Format response message
+            role = instruction_dict.get("role", "")
+            responsibility = instruction_dict.get("responsibility", "")
+            process_steps = instruction_dict.get("process_steps", [])
+            
+            response_message = (
+                f"✅ **Agent Configuration Complete!**\n\n"
+                f"**Role:** {role}\n\n"
+                f"**Responsibility:** {responsibility}\n\n"
+                f"**Process Steps:**\n"
+            )
+            for i, step in enumerate(process_steps, 1):
+                response_message += f"{i}. {step}\n"
+            
+            if recommended_tools:
+                response_message += f"\n**Recommended Tools:** {len(recommended_tools)} tools selected\n"
+            
+            result.update({
+                "stage": "complete",
+                "response_message": response_message,
+                "current_instruction": instruction_dict,
+                "recommended_tools": recommended_tools,
+                "needs_clarification": False
+            })
+        
+        return json.dumps(result, indent=2, default=str)
+        
+    except Exception as e:
+        import traceback
+        error_msg = f"Error in configure_agent_complete: {str(e)}"
+        logger.error(f"{error_msg}\n{traceback.format_exc()}")
+        
+        error_result = {
+            "stage": "error",
+            "response_message": f"I encountered an error: {error_msg}",
+            "needs_clarification": False,
+            "questions": [],
+            "is_unrelated": False,
+            "current_instruction": {},
+            "recommended_tools": [],
+            "success": False,
+            "error": str(e)
+        }
+        return json.dumps(error_result, indent=2, default=str)
+
+
 # @tool
 # def your_tool_here(your_arg: str):
 #     """Your tool description here."""
@@ -379,7 +749,8 @@ async def generate_clarification_questions(analysis_result: str) -> str:
 #     return "Your tool response here."
 
 tools = [
-    analyze_agent_requirements,
+    configure_agent_complete,  # Primary comprehensive tool
+    analyze_agent_requirements,  # Keep for backward compatibility
     search_tools_by_categories,
     recommend_tools_for_agent,
     generate_agent_instruction,
@@ -417,6 +788,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
         # and shouldn't be bound as backend tools to avoid duplicate function declarations with Gemini
         ag_ui_tools = state.get("tools", [])
         backend_tools = [
+            configure_agent_complete,  # Primary tool
             analyze_agent_requirements,
             search_tools_by_categories,
             recommend_tools_for_agent,
@@ -483,20 +855,37 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
         # Enhanced system message with agent configuration capabilities
         system_content = f"""You are a helpful assistant specialized in configuring AI agents. The current proverbs are {proverbs}.
 
-You have access to powerful agent configuration tools that allow you to:
-1. Analyze agent requirements - Use analyze_agent_requirements to understand what the user wants their agent to do
-2. Search for tools - Use search_tools_by_categories to find relevant tools from the database
-3. Recommend tools - Use recommend_tools_for_agent to intelligently select the best tools for an agent
-4. Generate instructions - Use generate_agent_instruction to create comprehensive agent configurations
-5. Ask clarifying questions - Use generate_clarification_questions when you need more information
+You have access to a powerful agent configuration tool:
 
-When a user wants to create or configure an agent:
-- First analyze their requirements using analyze_agent_requirements
-- If clarification is needed, use generate_clarification_questions
-- Search for relevant tools using search_tools_by_categories or recommend_tools_for_agent
-- Generate the final agent instruction using generate_agent_instruction
+**PRIMARY TOOL: configure_agent_complete**
+This is your main tool for agent configuration. It handles the complete workflow:
+1. Analyzes user requirements (with unrelated input detection)
+2. Asks clarification questions if needed
+3. Processes clarification answers
+4. Searches and recommends tools from vector database
+5. Generates comprehensive agent instructions
 
-Always provide clear, helpful responses and guide users through the agent configuration process."""
+**WORKFLOW:**
+- When user wants to create/configure an agent, use configure_agent_complete
+- Pass the user's input and optionally current_state_json if you have state information
+- The tool will return the current stage and what to do next
+- If needs_clarification=true, ask the questions to the user
+- If stage="complete", present the final instruction and tools to the user
+
+**STATE MANAGEMENT:**
+- Store the returned state in your memory/context
+- On subsequent calls, pass the previous state as current_state_json
+- This allows the tool to continue from where it left off
+
+**OTHER TOOLS (for specific needs):**
+- analyze_agent_requirements: Quick analysis only
+- search_tools_by_categories: Direct tool search
+- recommend_tools_for_agent: Tool ranking
+- generate_agent_instruction: Instruction generation
+- generate_clarification_questions: Question generation
+
+Always use configure_agent_complete as your primary tool for agent configuration workflows.
+Provide clear, helpful responses and guide users through the process step by step."""
         
         system_message = SystemMessage(content=system_content)
 

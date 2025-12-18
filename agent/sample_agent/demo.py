@@ -4,6 +4,14 @@ through our FastAPI integration. However, you can also host in LangGraph platfor
 """
 
 import os
+import sys
+from pathlib import Path
+
+# Add parent directory to path to allow imports when running directly
+parent_dir = Path(__file__).parent.parent
+if str(parent_dir) not in sys.path:
+    sys.path.insert(0, str(parent_dir))
+
 from dotenv import load_dotenv
 load_dotenv() # pylint: disable=wrong-import-position
 

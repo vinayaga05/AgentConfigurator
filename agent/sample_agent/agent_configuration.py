@@ -57,7 +57,7 @@ socket.setdefaulttimeout(10)
 # Load environment variables
 load_dotenv()
 
-GEMINI_API_KEY = "AIzaSyAexmgiw9q5QPXO8I1E6z38VnvngKFbSIQ"
+GOOGLE_API_KEY = "GOOGLE_API_KEY"
 
 # Configure logging to go to stderr
 logging.basicConfig(
@@ -245,26 +245,26 @@ class AgentConfigurationAssistant:
         """Initialize with Gemini model and optional thread_id for memory"""
         try:
             # Configure Google Gemini (moved from module level to avoid import-time hangs)
-            if GEMINI_API_KEY:
+            if GOOGLE_API_KEY:
                 try:
-                    genai.configure(api_key=GEMINI_API_KEY)
+                    genai.configure(api_key=GOOGLE_API_KEY)
                 except Exception as genai_error:
                     logger.warning(f"Warning: Could not configure genai directly: {genai_error}. Continuing with ChatGoogleGenerativeAI.")
             else:
-                raise ValueError("GEMINI_API_KEY is required")
+                raise ValueError("GOOGLE_API_KEY is required")
             
             # Log the model being used for debugging
             logger.info(f"Initializing AgentConfigurationAssistant with model: {model}")
             self.llm = ChatGoogleGenerativeAI(
                 model=model,
                 temperature=0.3,
-                google_api_key=GEMINI_API_KEY
+                google_api_key=GOOGLE_API_KEY
             )
             # Store model name for later comparison
             self.model_name = model
         except Exception as e:
             logger.error(f"Error initializing AgentConfigurationAssistant: {e}")
-            logger.info("Make sure you have set GEMINI_API_KEY and installed langchain-google-genai")
+            logger.info("Make sure you have set GOOGLE_API_KEY and installed langchain-google-genai")
             raise
             
         self.parser = PydanticOutputParser(pydantic_object=AgentInstruction)
