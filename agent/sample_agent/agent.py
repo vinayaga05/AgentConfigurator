@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 # Model configuration - can be set via environment variable
 # Default: "gemini" (switch to "ollama" in .env to use Ollama)
 MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "gemini").lower()
-MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.5-flash")
+MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.0-flash")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 DEFAULT_TEMPERATURE = float(os.getenv("MODEL_TEMPERATURE", "0.7"))
@@ -166,10 +166,7 @@ async def analyze_agent_requirements(agent_description: str) -> str:
     try:
         # Lazy import to avoid dependency issues at module load time
         AgentConfigurationAssistant = _get_assistant_class()
-        # Note: Tools don't have direct access to state, so we read model from environment
-        # Get model name from environment (for Gemini) or use default
-        model_name = os.getenv("MODEL_NAME", "gemini-2.5-flash")
-        assistant = AgentConfigurationAssistant(model=model_name)
+        assistant = AgentConfigurationAssistant(model=MODEL_NAME)
         
         # Call the analysis method
         result = await assistant.analyze_agent_role_and_responsibility(agent_description)
@@ -208,9 +205,8 @@ async def search_tools_by_categories(categories: str, user_input: str = "", limi
     try:
         # Lazy import to avoid dependency issues at module load time
         AgentConfigurationAssistant = _get_assistant_class()
-        # Get model name from environment (for Gemini) or use default
-        model_name = os.getenv("MODEL_NAME", "gemini-2.5-flash")
-        assistant = AgentConfigurationAssistant(model=model_name)
+        # Use centralized model name
+        assistant = AgentConfigurationAssistant(model=MODEL_NAME)
         
         # Parse categories JSON
         categories_dict = json.loads(categories) if isinstance(categories, str) else categories
@@ -248,9 +244,8 @@ async def recommend_tools_for_agent(user_input: str, current_instruction: str, a
     try:
         # Lazy import to avoid dependency issues at module load time
         AgentConfigurationAssistant = _get_assistant_class()
-        # Get model name from environment (for Gemini) or use default
-        model_name = os.getenv("MODEL_NAME", "gemini-2.5-flash")
-        assistant = AgentConfigurationAssistant(model=model_name)
+        # Use centralized model name
+        assistant = AgentConfigurationAssistant(model=MODEL_NAME)
         
         # Parse JSON inputs
         instruction_dict = json.loads(current_instruction) if isinstance(current_instruction, str) else current_instruction
@@ -298,9 +293,8 @@ async def generate_agent_instruction(current_instruction: str, recommended_tools
     try:
         # Lazy import to avoid dependency issues at module load time
         AgentConfigurationAssistant = _get_assistant_class()
-        # Get model name from environment (for Gemini) or use default
-        model_name = os.getenv("MODEL_NAME", "gemini-2.5-flash")
-        assistant = AgentConfigurationAssistant(model=model_name)
+        # Use centralized model name
+        assistant = AgentConfigurationAssistant(model=MODEL_NAME)
         
         # Parse JSON inputs
         instruction_dict = json.loads(current_instruction) if isinstance(current_instruction, str) else current_instruction
@@ -353,9 +347,8 @@ async def generate_clarification_questions(analysis_result: str) -> str:
     try:
         # Lazy import to avoid dependency issues at module load time
         AgentConfigurationAssistant = _get_assistant_class()
-        # Get model name from environment (for Gemini) or use default
-        model_name = os.getenv("MODEL_NAME", "gemini-2.5-flash")
-        assistant = AgentConfigurationAssistant(model=model_name)
+        # Use centralized model name
+        assistant = AgentConfigurationAssistant(model=MODEL_NAME)
         
         # Parse analysis result JSON
         analysis_dict = json.loads(analysis_result) if isinstance(analysis_result, str) else analysis_result
@@ -405,8 +398,8 @@ async def configure_agent_complete(
     try:
         # Lazy import to avoid dependency issues
         AgentConfigurationAssistant = _get_assistant_class()
-        model_name = os.getenv("MODEL_NAME", "gemini-2.5-flash")
-        assistant = AgentConfigurationAssistant(model=model_name)
+        # Use centralized model name
+        assistant = AgentConfigurationAssistant(model=MODEL_NAME)
         
         # Parse current state
         current_state = {}
@@ -510,7 +503,8 @@ async def configure_agent_complete(
                     "needs_clarification": True,
                     "questions": questions,
                     "analysis_result": analysis_result,
-                    "agent_summary": agent_summary
+                    "agent_summary": agent_summary,
+                    "question_round": 1  # Initialize question round tracking
                 })
             else:
                 # Clear requirements - proceed to tool selection
@@ -541,31 +535,133 @@ async def configure_agent_complete(
             if not pending_questions:
                 pending_questions = previous_analysis.get("questions", [])
             
-            # Process clarification answers
-            answer_result = await assistant.get_answers_for_agent_role_questions(
-                user_input=user_input,
-                agent_summary=agent_summary,
-                questions_list=pending_questions,
-                streaming_events=None
+            # Track question rounds to prevent infinite loops
+            question_round = current_state.get("question_round", 1)
+            previous_clarity = agent_summary.get("requirement_clarity_score", 0.0)
+            
+            # Process clarification answers using analyze_agent_role_and_responsibility
+            analysis_result = await assistant.analyze_agent_role_and_responsibility(
+                user_input,
+                streaming_events=None,
+                full_context=full_context,
+                previous_analysis=agent_summary,
+                pending_questions=pending_questions,
+                is_clarification_response=True
             )
             
-            # Update agent summary with answers
-            updated_summary = answer_result.get("updated_agent_summary", agent_summary)
-            remaining_questions = answer_result.get("remaining_questions", [])
-            clarity_score = answer_result.get("clarity_score", 0.0)
-            still_needs_clarification = answer_result.get("needs_clarification", True)
+            # Extract updated information from analysis result
+            response_message = analysis_result.get("response_message", "")
+            still_needs_clarification = analysis_result.get("needs_clarification", True)
+            remaining_questions = analysis_result.get("questions", [])
+            new_clarity_score = analysis_result.get("requirement_clarity_score", previous_clarity)
+            clarity_improvement = new_clarity_score - previous_clarity
             
-            # Update agent summary
-            agent_summary = updated_summary
+            # Update agent summary with new analysis
+            agent_summary = {
+                **agent_summary,
+                "purpose": analysis_result.get("purpose", agent_summary.get("purpose", "")),
+                "role": analysis_result.get("role", agent_summary.get("role", "")),
+                "responsibility": analysis_result.get("responsibility", agent_summary.get("responsibility", "")),
+                "core_responsibilities": analysis_result.get("core_responsibilities", agent_summary.get("core_responsibilities", [])),
+                "expected_workflow": analysis_result.get("expected_workflow", agent_summary.get("expected_workflow", [])),
+                "requirement_clarity_score": new_clarity_score
+            }
             
-            if still_needs_clarification and remaining_questions:
+            # Enhanced decision logic with answer completeness check first, then clarity score thresholds
+            should_proceed = False
+            
+            # Check if user provided substantial response (not empty or too short)
+            user_response_length = len(user_input.strip()) if user_input else 0
+            has_substantial_response = user_response_length > 10
+            
+            # PRIORITY RULE 1: If user answered all questions (no remaining questions) AND provided substantial response
+            # AND clarity score is acceptable, proceed immediately
+            if (not remaining_questions or len(remaining_questions) == 0) and has_substantial_response:
+                if new_clarity_score >= 0.7:
+                    should_proceed = True
+                    logger.info(f"Proceeding: User answered all {len(pending_questions)} questions, proceeding with score {new_clarity_score:.2f}")
+                elif new_clarity_score >= 0.65 and question_round >= 2:
+                    # After 2 rounds, be lenient if all questions answered
+                    should_proceed = True
+                    logger.info(f"Proceeding: User answered all {len(pending_questions)} questions after {question_round} rounds, score {new_clarity_score:.2f}")
+            
+            # Rule 2: High clarity score - always proceed
+            elif new_clarity_score >= 0.8:
+                should_proceed = True
+                logger.info(f"Proceeding: High clarity score ({new_clarity_score:.2f})")
+            
+            # Rule 3: Good score with significant improvement - proceed
+            elif new_clarity_score >= 0.75 and clarity_improvement >= 0.15:
+                should_proceed = True
+                logger.info(f"Proceeding: Good score ({new_clarity_score:.2f}) with significant improvement ({clarity_improvement:.2f})")
+            
+            # Rule 4: Good score and no remaining questions
+            elif new_clarity_score >= 0.75 and (not remaining_questions or len(remaining_questions) == 0):
+                should_proceed = True
+                logger.info(f"Proceeding: Good score ({new_clarity_score:.2f}) with no remaining questions")
+            
+            # Rule 5: After 2 rounds, be more lenient
+            elif question_round >= 2 and new_clarity_score >= 0.7:
+                should_proceed = True
+                logger.info(f"Proceeding: After {question_round} rounds, clarity score is acceptable ({new_clarity_score:.2f})")
+            
+            # Rule 6: After 3 rounds, proceed unless score is very low
+            elif question_round >= 3:
+                if new_clarity_score >= 0.65:
+                    should_proceed = True
+                    logger.info(f"Proceeding: After {question_round} rounds, proceeding with score {new_clarity_score:.2f}")
+                else:
+                    # Even after 3 rounds, if score is too low, proceed anyway (we'll refine during instruction generation)
+                    should_proceed = True
+                    logger.warning(f"Proceeding after {question_round} rounds despite low score ({new_clarity_score:.2f}) - will refine during instruction generation")
+            
+            # Rule 7: If still needs clarification but no new questions, proceed
+            elif still_needs_clarification and (not remaining_questions or len(remaining_questions) == 0):
+                should_proceed = True
+                logger.info("Proceeding: No remaining questions despite needs_clarification flag")
+            
+            if should_proceed or not (still_needs_clarification and remaining_questions):
+                # Clarification complete - proceed to tool selection
+                if not response_message:
+                    if clarity_improvement > 0:
+                        response_message = (
+                            f"Perfect! I have all the information I need. "
+                            f"Clarity improved from {previous_clarity:.2f} to {new_clarity_score:.2f}. "
+                            f"Let me find the appropriate tools for your agent...\n"
+                        )
+                    else:
+                        response_message = (
+                            f"Perfect! I have all the information I need. "
+                            f"Let me find the appropriate tools for your agent...\n"
+                        )
+                
+                result.update({
+                    "stage": "tool_selection",
+                    "response_message": response_message,
+                    "needs_clarification": False,
+                    "agent_summary": agent_summary,
+                    "analysis_result": analysis_result,
+                    "question_round": 0  # Reset for next agent
+                })
+            else:
                 # Still need more clarification
-                questions_text = "\n\n".join([f"**{i+1}.** {q.strip()}" for i, q in enumerate(remaining_questions)])
-                response_message = (
-                    f"Thank you for the information. I still need a few more details:\n\n"
-                    f"{questions_text}\n\n"
-                    f"Please provide answers to these remaining questions.\n"
-                )
+                question_round += 1
+                if not response_message:
+                    questions_text = "\n\n".join([f"**{i+1}.** {q.strip()}" for i, q in enumerate(remaining_questions)])
+                    if clarity_improvement > 0:
+                        response_message = (
+                            f"Thank you for the information. "
+                            f"Clarity improved from {previous_clarity:.2f} to {new_clarity_score:.2f}. "
+                            f"I still need a few more details:\n\n"
+                            f"{questions_text}\n\n"
+                            f"Please provide answers to these remaining questions.\n"
+                        )
+                    else:
+                        response_message = (
+                            f"Thank you for the information. I still need a few more details:\n\n"
+                            f"{questions_text}\n\n"
+                            f"Please provide answers to these remaining questions.\n"
+                        )
                 
                 result.update({
                     "stage": "clarification",
@@ -573,26 +669,8 @@ async def configure_agent_complete(
                     "needs_clarification": True,
                     "questions": remaining_questions,
                     "agent_summary": agent_summary,
-                    "analysis_result": {
-                        **previous_analysis,
-                        **updated_summary
-                    }
-                })
-            else:
-                # Clarification complete - proceed to tool selection
-                response_message = (
-                    f"Perfect! I have all the information I need. Let me find the appropriate tools for your agent...\n"
-                )
-                
-                result.update({
-                    "stage": "tool_selection",
-                    "response_message": response_message,
-                    "needs_clarification": False,
-                    "agent_summary": agent_summary,
-                    "analysis_result": {
-                        **previous_analysis,
-                        **updated_summary
-                    }
+                    "analysis_result": analysis_result,
+                    "question_round": question_round
                 })
         
         # STAGE 3: Tool Selection - Extract categories and search tools

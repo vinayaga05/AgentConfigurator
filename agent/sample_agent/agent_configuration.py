@@ -73,6 +73,10 @@ socket.setdefaulttimeout(10)
 # Load environment variables
 load_dotenv()
 
+# Model configuration - centralized model name
+# Can be overridden via MODEL_NAME environment variable
+DEFAULT_MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.0-flash")
+
 # Configure logging to go to stderr
 logging.basicConfig(
     level=logging.INFO,
@@ -255,9 +259,12 @@ class LLMTimingContext:
         return False  # Don't suppress exceptions
 
 class AgentConfigurationAssistant:
-    def __init__(self, model="gemini-2.5-flash", thread_id: Optional[str] = None):
+    def __init__(self, model: Optional[str] = None, thread_id: Optional[str] = None):
         """Initialize with Gemini model and optional thread_id for memory"""
         try:
+            # Use provided model or default to centralized model name
+            model = model or DEFAULT_MODEL_NAME
+            
             GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
             # Configure Google Gemini (moved from module level to avoid import-time hangs)
             if GOOGLE_API_KEY:
@@ -701,97 +708,6 @@ class AgentConfigurationAssistant:
                     "questions": []
                 }
 
-    async def _generate_clarification_response(self, user_input: str, extracted_requirements: Dict, clarification_questions: Optional[List[str]] = None, streaming_events: Optional[List] = None) -> str:
-        """Generate a natural, conversational LLM response that processes the user's clarification input.
-        
-        Args:
-            user_input: The user's clarification input/response
-            extracted_requirements: Dict containing role, responsibility, process_steps, etc.
-            clarification_questions: Optional list of questions that were asked (for context)
-            streaming_events: Optional list to append streaming events to
-            
-        Returns:
-            The generated response text (string)
-        """
-        # Build context from extracted requirements
-        role = extracted_requirements.get("role", "")
-        responsibility = extracted_requirements.get("responsibility", "")
-        process_steps = extracted_requirements.get("process_steps", [])
-        
-        requirements_context = ""
-        if role or responsibility or process_steps:
-            requirements_context = f"""
-            Based on what I understand so far about the agent:
-            - Role: {role if role else "Not specified"}
-            - Responsibility: {responsibility if responsibility else "Not specified"}
-            - Process Steps: {json.dumps(process_steps, indent=2) if process_steps else "Not specified"}
-            """
-        
-        # Add context about previous questions if available
-        questions_context = ""
-        if clarification_questions:
-            questions_text = "\n".join([f"- {q}" for q in clarification_questions])
-            questions_context = f"""
-            Previous clarification questions that were asked:
-            {questions_text}
-            """
-        
-        clarification_prompt = f"""
-        You are an expert AI assistant helping users configure AI agents. The user has provided clarification information in response to previous questions or user has asked a question .
-        
-        {requirements_context}
-        
-        {questions_context}
-        
-        User's clarification input: "{user_input}"
-        
-        Generate a natural, conversational, and helpful response that:
-
-        - If the user is clarifying previous questions, follow steps 1-5 below.
-        - If the user is asking a new question related to agent instruction or configuration, answer their question thoughtfully using the extracted_requirements context and offer further assistance as needed.
-        
-        1. Acknowledge and confirm what the user has provided in their clarification or question.
-        2. Use the extracted_requirements context to explain how their clarification or question fits into the agent configuration.
-        3. Provide helpful feedback, guidance, or next steps based on their input.
-        4. If more information is still needed, ask natural follow-up questions.
-        5. If enough information is provided, clearly acknowledge that you can proceed with creating or updating the agent instructions.
-        
-        Be warm, professional, and concise. Show that you understand their clarification and how it relates to building their agent.
-        """
-        
-        try:
-            content = ""
-            accumulated = ""
-            with LLMTimingContext("Generate Clarification Response", self):
-                response = await self.llm.ainvoke([HumanMessage(content=clarification_prompt)])
-                if hasattr(response, 'content') and response.content:
-                    content = response.content
-                    accumulated = content
-                    
-                    # Stream as message_delta if streaming_events list is provided
-                    if streaming_events is not None:
-                        streaming_events.append({
-                            "type": "message_delta",
-                            "timestamp": time.time(),
-                            "data": {
-                                "delta": accumulated,
-                                "accumulated": accumulated,
-                                "role": "assistant",
-                                "content": accumulated
-                            }
-                        })
-                content = accumulated.strip()
-            
-            # Log the response
-            self._log_llm_response(content, "Generate Clarification Response")
-            
-            return content
-            
-        except Exception as e:
-            logger.error(f"Error generating clarification response: {e}")
-            # Fallback response
-            return f"Thank you for the clarification. I understand: {user_input}. Let me process this information to help configure your agent."
-
     async def _detect_if_unrelated_to_agent_role(self, user_input: str, streaming_events: Optional[List] = None) -> Dict:
         """
         Detect if user input is a greeting or unrelated to agent role/responsibility.
@@ -925,7 +841,15 @@ class AgentConfigurationAssistant:
             # Fallback to a friendly default message
             return "I'm here to help you configure an AI agent! Please describe what role and responsibilities you'd like your agent to have. For example, you could say 'Create an agent that handles customer support inquiries' or 'I need an agent to process invoices'."
 
-    async def analyze_agent_role_and_responsibility(self, agent_description_or_name: str, streaming_events: Optional[List] = None, full_context: Optional[Dict] = None) -> Dict:
+    async def analyze_agent_role_and_responsibility(
+        self, 
+        agent_description_or_name: str, 
+        streaming_events: Optional[List] = None, 
+        full_context: Optional[Dict] = None,
+        previous_analysis: Optional[Dict] = None,
+        pending_questions: Optional[List[str]] = None,
+        is_clarification_response: bool = False
+    ) -> Dict:
         """
         Agent Role & Responsibility Analyzer.
         
@@ -935,8 +859,15 @@ class AgentConfigurationAssistant:
         - The type of information it needs to collect from the user
         - The expected workflow or actions it should perform
         
+        Can also handle clarification responses by updating analysis based on user answers.
+        
         Args:
-            agent_description_or_name: The agent's description or name to analyze
+            agent_description_or_name: The agent's description or name to analyze, or clarification answers
+            streaming_events: Optional list to append streaming events to
+            full_context: Optional full context dictionary with conversation history
+            previous_analysis: Optional previous analysis result if this is a clarification response
+            pending_questions: Optional list of questions that were previously asked
+            is_clarification_response: Flag indicating if this is a clarification response to previous questions
             
         Returns:
             Dict containing structured analysis with:
@@ -945,8 +876,11 @@ class AgentConfigurationAssistant:
             - required_user_information: List of information types needed from users
             - expected_workflow: List of expected actions/workflow steps
             - role: agent's role
-            - responsibilities: agent's responsibilities
+            - responsibility: agent's responsibility
             - analysis_summary: Brief summary of the analysis
+            - questions: List of clarification questions (if needed)
+            - response_message: Natural language response message
+            - needs_clarification: Boolean indicating if more clarification is needed
         """
         
         # Early detection: Check if input is greeting or unrelated to agent role/responsibility
@@ -977,9 +911,64 @@ class AgentConfigurationAssistant:
         if conversation_context:
             conversation_context = f"\n        {conversation_context.replace(chr(10), chr(10) + '        ')}\n        "
         
+        # Detect if this is a clarification response
+        clarification_context = ""
+        if is_clarification_response and previous_analysis and pending_questions:
+            previous_clarity = previous_analysis.get("requirement_clarity_score", 0.0)
+            clarification_context = f"""
+        IMPORTANT CONTEXT DETECTION:
+        This is a CLARIFICATION RESPONSE - The user is providing answers to previous questions, not making a new request.
+        
+        Previous Analysis (Before User Answers):
+        {json.dumps(previous_analysis, indent=2)}
+        
+        Previous Clarity Score: {previous_clarity}
+        
+        Questions That Were Asked (and user is now answering):
+        {json.dumps(pending_questions, indent=2)}
+        
+        User's Response (Answers to the above questions):
+        "{agent_description_or_name}"
+        
+        CRITICAL INSTRUCTIONS FOR CLARIFICATION RESPONSES:
+        
+        STEP 1: ANSWER VALIDATION - Check if user's response addresses EACH of the {len(pending_questions)} questions asked
+        - Go through each question in the list above one by one
+        - For each question, determine if the user's response provides information that answers that question
+        - Track which questions were answered and which were not answered
+        - Be fair: If the user's response provides relevant information even if not in direct answer format, consider it answered
+        
+        STEP 2: ANALYSIS UPDATE
+        1. Analyze the user's input as answers to the pending questions
+        2. Update the agent analysis by incorporating information from the answers
+        3. Calculate the NEW requirement_clarity_score based on how well the answers filled the gaps
+        4. Compare the NEW score to the PREVIOUS score ({previous_clarity})
+        5. Generate a natural response_message acknowledging the clarification
+        
+        STEP 3: DECISION RULES FOR needs_clarification (STRICT VALIDATION):
+        - If user answered ALL {len(pending_questions)} questions AND clarity_score >= 0.7: 
+          Set needs_clarification to FALSE (proceed to agent creation) - NO EXCEPTIONS
+        - If NEW clarity_score >= 0.8: Set needs_clarification to FALSE (proceed to agent creation)
+        - If NEW clarity_score >= 0.75 AND score improved by 0.15+ from previous: Set needs_clarification to FALSE (good progress, proceed)
+        - ONLY set needs_clarification to TRUE if:
+          * Some original questions weren't answered (in this case, ask ONLY about unanswered questions)
+          * Answers revealed NEW critical gaps that weren't in original questions (ask about new gaps only, max 3-4)
+          * NEW clarity_score < 0.7 AND critical gaps remain
+        - Do NOT ask new questions if user answered all your questions and clarity is acceptable (>=0.7)
+        
+        IMPORTANT: If user answered all questions, you should proceed unless clarity_score < 0.7.
+        Only generate new questions if: (1) some original questions weren't answered, OR (2) answers revealed NEW critical gaps not covered in original questions.
+        
+        If you DO need more clarification, generate questions ONLY for:
+        - Unanswered original questions (prioritize these)
+        - NEW critical gaps revealed by answers (max 3-4 new questions)
+        - Focus on what's absolutely essential for implementation
+        """
+        
         analysis_prompt = f"""
         You are an Agent Configuration Analyzer. Your job is to understand the role and responsibilities of an agent from a given description or name.
 
+        {clarification_context}
         {conversation_context}
         Agent Description/Name: "{agent_description_or_name}"
 
@@ -1007,6 +996,66 @@ class AgentConfigurationAssistant:
            - Be strict: When in doubt, set needs_clarification to TRUE. It's better to ask for clarification than to make incorrect assumptions.
         8. On a scale of 0.0 to 1.0, how clear and complete is the current requirement or description? Provide this number (float between 0.0 and 1.0) as "requirement_clarity_score" (1.0 = perfectly clear and nothing missing, 0.0 = nothing is clear).
            - This score should correlate with needs_clarification: scores below 0.7 typically indicate clarification is needed.
+        9. Question Generation (ONLY for NEW requests, not clarification responses):
+           - If this is a clarification response, skip this section and go to section 10
+           - CRITICAL: This is your ONLY chance to ask initial questions - be thorough and comprehensive
+           - Generate ALL missing information questions comprehensively (5-8 questions recommended, but ask about EVERY gap you identify)
+           - You must identify ALL missing elements and ask about them in this single round. Do not hold back questions for later rounds.
+           - Before generating questions, ensure you've identified gaps in ALL of these areas:
+             * Tools/systems: Which tools/systems the agent needs, what data sources, what actions
+             * Workflow steps: Specific steps the agent should follow
+             * Data sources: What data the agent needs to access
+             * Business rules: Rules, constraints, or edge cases
+             * User requirements: Target users, use cases, success criteria
+           - Questions should focus on:
+             * Tool-related questions: Which tools/systems the agent needs, what data sources, what actions
+             * Main task/role questions: Essential questions about primary function, triggers, behavior
+             * Missing elements: Critical information gaps preventing the agent from functioning
+             * Tool confirmations: If specific tools are mentioned, confirm their usage
+           - DO NOT ask about:
+             * Integration methods or authentication (handled by app infrastructure)
+             * Technical setup details (app manages automatically)
+             * Less critical preferences (unless core to primary function)
+           - Prioritize tool-related questions first, but ensure you cover ALL identified gaps
+           - Questions should be specific, realistic, and focused on what the agent needs to know
+           - If needs_clarification is FALSE, return an empty array for questions
+        10. Clarification Response Handling (ONLY if this is a clarification response):
+            - CRITICAL: This is a follow-up after the user answered your questions.
+            - FIRST STEP: Check if the user's response addresses ALL the questions you asked
+            - For each question in pending_questions, determine if the user's answer addresses it:
+              * Go through each question one by one
+              * Check if the user's response provides information that answers that question
+              * Mark which questions were answered and which were not
+            - Analyze the user's input as answers to the pending questions
+            - Update the agent analysis by incorporating information from the answers:
+              * Update role, responsibility, workflow based on answers
+              * Fill in missing elements that were clarified
+              * Calculate NEW clarity_score based on completeness of answers
+              * Compare NEW score to PREVIOUS score (from previous_analysis)
+            - Generate a natural, conversational response_message that:
+              * Acknowledges what the user provided
+              * Confirms understanding of the clarification
+              * Explains how the clarification improves the agent configuration
+              * Indicates if more information is needed or if ready to proceed
+            - Determine if more clarification is needed (STRICT RULES):
+              * If user answered ALL questions AND clarity_score >= 0.7: Set needs_clarification to FALSE (proceed)
+              * If NEW clarity_score >= 0.8: Set needs_clarification to FALSE (proceed)
+              * If NEW clarity_score >= 0.75 AND score improved by 0.15+ from previous: Set needs_clarification to FALSE
+              * ONLY set needs_clarification to TRUE if:
+                - Some original questions weren't answered (ask about those specifically)
+                - Answers revealed NEW critical gaps that weren't in original questions (ask about new gaps only)
+                - NEW clarity_score < 0.7 AND critical gaps remain
+              * Do NOT ask new questions if user answered all your questions and clarity is acceptable (>=0.7)
+            - If needs_clarification is TRUE, generate questions ONLY for:
+              * Unanswered original questions (prioritize these)
+              * NEW critical gaps revealed by answers (max 3-4 new questions)
+              * Focus on what's absolutely essential for implementation
+              * Do NOT ask about minor details or preferences
+              * Prioritize: tool requirements > workflow steps > edge cases
+        11. Response Message Generation:
+            - For new requests with questions: Generate a brief acknowledgment message that introduces the questions
+            - For clarification responses: Generate response_message as described in section 10
+            - For clear requests (no clarification needed): Generate a confirmation message that analysis is complete
 
         Return a single JSON object with these keys (keep names exactly as below):
         {{
@@ -1030,7 +1079,9 @@ class AgentConfigurationAssistant:
             "role": "Short description of the agent's role (e.g., 'Customer Support Agent', 'Data Analyst Assistant')",
             "responsibility": "Short description of the agent's primary responsibility (e.g., 'Handle customer inquiries and resolve issues')",
             "needs_clarification": true,
-            "requirement_clarity_score": 0.9
+            "requirement_clarity_score": 0.9,
+            "questions": [],  // Array of ALL missing information questions (5-8 recommended, but ask about every identified gap) - only populate if needs_clarification is true and this is NOT a clarification response
+            "response_message": ""  // Natural language response (for clarification responses or when questions are asked)
         }}
 
         IMPORTANT GUIDELINES FOR "needs_clarification":
@@ -1116,10 +1167,11 @@ class AgentConfigurationAssistant:
             self.analysis_result = analysis_result
             
             logger.info(f"Agent Role & Responsibility Analysis completed for: {agent_description_or_name}")
-            # Step 2: Generate configuration questions from the analysis
-            self.questions_result = await self.generate_questions(analysis_result)
-            questions_list = self.questions_result.get("questions", [])
-            # print(f"Questions Result: {self.questions_result}")
+            
+            # Extract questions directly from analysis_result (generated in same LLM call)
+            questions_list = analysis_result.get("questions", [])
+            # Limit to maximum 8 questions and filter out empty/invalid questions
+            questions_list = [q.strip() for q in questions_list if q and q.strip()][:8]
 
             # Include needs_clarification in output with programmatic enforcement
             needs_clarification = analysis_result.get("needs_clarification", False)
@@ -1146,7 +1198,8 @@ class AgentConfigurationAssistant:
                 "analysis_summary": analysis_result.get("analysis_summary", ""),
                 "success": True,
                 "questions": questions_list,
-                "needs_clarification": needs_clarification
+                "needs_clarification": needs_clarification,
+                "response_message": analysis_result.get("response_message", "")
             }
             
         except json.JSONDecodeError as e:
@@ -1183,6 +1236,10 @@ class AgentConfigurationAssistant:
     async def generate_questions(self, analysis_result: Dict, streaming_events: Optional[List] = None) -> Dict:
         """
         Agent Configuration Question Generator.
+        
+        DEPRECATED: This method is kept for backward compatibility with the generate_clarification_questions tool.
+        Question generation is now integrated directly into analyze_agent_role_and_responsibility.
+        For new code, use analyze_agent_role_and_responsibility which includes question generation in the same LLM call.
         
         Takes a structured analysis result from analyze_agent_role_and_responsibility and generates
         a list of questions that must be asked to the user to gather all missing details required
@@ -2678,15 +2735,38 @@ Return ONLY the JSON response, no additional formatting, markdown, or explanator
                 clarification_questions = result.get("clarification_questions", [])
                 extracted_reqs = result.get("extracted_requirements", {})
                 
-                # Generate clarification response using LLM based on user input and extracted requirements
+                # Generate clarification response using analyze_agent_role_and_responsibility with clarification parameters
                 if extracted_reqs:
-                    clarification_response = await self._generate_clarification_response(
-                        user_input=user_input,
-                        extracted_requirements=extracted_reqs,
-                        clarification_questions=clarification_questions,
-                        streaming_events=streaming_events
+                    # Build previous analysis from extracted_reqs for context
+                    previous_analysis = {
+                        "role": extracted_reqs.get("role", ""),
+                        "responsibility": extracted_reqs.get("responsibility", ""),
+                        "purpose": extracted_reqs.get("purpose", ""),
+                        "core_responsibilities": extracted_reqs.get("core_responsibilities", []),
+                        "expected_workflow": extracted_reqs.get("process_steps", []),
+                        "analysis_summary": ""
+                    }
+                    
+                    clarification_analysis = await self.analyze_agent_role_and_responsibility(
+                        agent_description_or_name=user_input,
+                        streaming_events=streaming_events,
+                        full_context=full_context,
+                        previous_analysis=previous_analysis,
+                        pending_questions=clarification_questions,
+                        is_clarification_response=True
                     )
+                    
+                    # Extract response_message from the analysis result
+                    clarification_response = clarification_analysis.get("response_message", "")
                     result["clarification_response"] = clarification_response
+                    
+                    # Update extracted_requirements with updated analysis if available
+                    if clarification_analysis.get("role") or clarification_analysis.get("responsibility"):
+                        result["extracted_requirements"].update({
+                            "role": clarification_analysis.get("role", extracted_reqs.get("role", "")),
+                            "responsibility": clarification_analysis.get("responsibility", extracted_reqs.get("responsibility", "")),
+                            "process_steps": clarification_analysis.get("expected_workflow", extracted_reqs.get("process_steps", []))
+                        })
             
             # Save current_instruction from extracted_requirements
             extracted_reqs = result.get("extracted_requirements", {})
