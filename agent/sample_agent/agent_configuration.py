@@ -76,6 +76,9 @@ load_dotenv()
 # Model configuration - centralized model name
 # Can be overridden via MODEL_NAME environment variable
 DEFAULT_MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.0-flash")
+MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "gemini").lower()
+HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "mistralai/Mistral-7B-Instruct-v0.2")
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "")
 
 # Configure logging to go to stderr
 logging.basicConfig(
@@ -259,34 +262,79 @@ class LLMTimingContext:
         return False  # Don't suppress exceptions
 
 class AgentConfigurationAssistant:
-    def __init__(self, model: Optional[str] = None, thread_id: Optional[str] = None):
-        """Initialize with Gemini model and optional thread_id for memory"""
+    def __init__(self, model: Optional[str] = None, provider: Optional[str] = None, thread_id: Optional[str] = None):
+        """Initialize with LLM model (Gemini, Ollama, or Hugging Face) and optional thread_id for memory"""
         try:
             # Use provided model or default to centralized model name
             model = model or DEFAULT_MODEL_NAME
-            
-            GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
-            # Configure Google Gemini (moved from module level to avoid import-time hangs)
-            if GOOGLE_API_KEY:
-                try:
-                    genai.configure(api_key=GOOGLE_API_KEY)
-                except Exception as genai_error:
-                    logger.warning(f"Warning: Could not configure genai directly: {genai_error}. Continuing with ChatGoogleGenerativeAI.")
-            else:
-                raise ValueError("GOOGLE_API_KEY is required")
+            provider = (provider or MODEL_PROVIDER).lower()
             
             # Log the model being used for debugging
-            logger.info(f"Initializing AgentConfigurationAssistant with model: {model}")
-            self.llm = ChatGoogleGenerativeAI(
-                model=model,
-                temperature=0.3,
-                google_api_key=GOOGLE_API_KEY
-            )
-            # Store model name for later comparison
+            logger.info(f"Initializing AgentConfigurationAssistant with provider: {provider}, model: {model}")
+            
+            if provider == "gemini":
+                GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+                # Configure Google Gemini (moved from module level to avoid import-time hangs)
+                if GOOGLE_API_KEY:
+                    try:
+                        genai.configure(api_key=GOOGLE_API_KEY)
+                    except Exception as genai_error:
+                        logger.warning(f"Warning: Could not configure genai directly: {genai_error}. Continuing with ChatGoogleGenerativeAI.")
+                else:
+                    raise ValueError("GOOGLE_API_KEY is required")
+                
+                self.llm = ChatGoogleGenerativeAI(
+                    model=model,
+                    temperature=0.3,
+                    google_api_key=GOOGLE_API_KEY
+                )
+            
+            elif provider == "ollama":
+                from langchain_ollama import ChatOllama
+                OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+                OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+                self.llm = ChatOllama(
+                    model=model or OLLAMA_MODEL,
+                    base_url=OLLAMA_BASE_URL,
+                    temperature=0.3
+                )
+            
+            elif provider == "huggingface_hub":
+                from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+                
+                # Step 1: Create the HuggingFaceEndpoint with text-generation task
+                # This uses the standard Hugging Face Inference API (not chat completion endpoint)
+                endpoint = HuggingFaceEndpoint(
+                    repo_id=model or HUGGINGFACE_MODEL,
+                    task="text-generation",  # IMPORTANT: Use text-generation task
+                    temperature=0.7,
+                    huggingfacehub_api_token=HUGGINGFACE_API_KEY if HUGGINGFACE_API_KEY else None
+                )
+                
+                # Step 2: Wrap it with ChatHuggingFace
+                self.llm = ChatHuggingFace(llm=endpoint)
+            
+            else:
+                raise ValueError(f"Unsupported provider: {provider}. Use 'gemini', 'ollama', or 'huggingface_hub'")
+            
+            # Store model name and provider for later comparison
             self.model_name = model
+            self.provider = provider
+        except ImportError as e:
+            if "langchain_ollama" in str(e) or "ollama" in str(e):
+                raise ImportError("langchain-ollama not installed. Install with: pip install langchain-ollama")
+            elif "langchain_huggingface" in str(e) or "huggingface" in str(e):
+                raise ImportError("langchain-huggingface not installed. Install with: pip install langchain-huggingface")
+            else:
+                raise
         except Exception as e:
             logger.error(f"Error initializing AgentConfigurationAssistant: {e}")
-            logger.info("Make sure you have set GOOGLE_API_KEY and installed langchain-google-genai")
+            if provider == "gemini":
+                logger.info("Make sure you have set GOOGLE_API_KEY and installed langchain-google-genai")
+            elif provider == "ollama":
+                logger.info("Make sure you have installed langchain-ollama and Ollama is running")
+            elif provider == "huggingface_hub":
+                logger.info("Make sure you have installed langchain-huggingface")
             raise
             
         self.parser = PydanticOutputParser(pydantic_object=AgentInstruction)

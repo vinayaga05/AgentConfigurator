@@ -28,11 +28,13 @@ logger = logging.getLogger(__name__)
 # The import will happen when tools are actually called
 
 # Model configuration - can be set via environment variable
-# Default: "gemini" (switch to "ollama" in .env to use Ollama)
+# Default: "gemini" (switch to "ollama" or "huggingface_hub" in .env to use different providers)
 MODEL_PROVIDER = os.getenv("MODEL_PROVIDER", "gemini").lower()
 MODEL_NAME = os.getenv("MODEL_NAME", "gemini-2.0-flash")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+HUGGINGFACE_MODEL = os.getenv("HUGGINGFACE_MODEL", "meta-llama/Llama-2-7b-chat-hf")
+HUGGINGFACE_API_KEY = os.getenv("HUGGINGFACE_API_KEY", "")
 DEFAULT_TEMPERATURE = float(os.getenv("MODEL_TEMPERATURE", "0.7"))
 
 class AgentState(MessagesState):
@@ -49,7 +51,7 @@ class AgentState(MessagesState):
     tools: List[Any]
     agent_analysis: Dict[str, Any] = {}
     agent_config_assistant: Optional[Any] = None  # Type is Any to avoid import at module load time
-    model_provider: str = MODEL_PROVIDER  # Model provider: "gemini" or "ollama"
+    model_provider: str = MODEL_PROVIDER  # Model provider: "gemini", "ollama", or "huggingface_hub"
     model_name: str = MODEL_NAME  # Model name for the selected provider
     agent_config_state: Dict[str, Any] = {}  # Stores configuration workflow state
     # your_custom_agent_state: str = ""
@@ -79,6 +81,8 @@ def get_model_config_from_state(state: AgentState, temperature: Optional[float] 
         # Use provider-specific default
         if provider == "ollama":
             model_name = OLLAMA_MODEL
+        elif provider == "huggingface_hub":
+            model_name = HUGGINGFACE_MODEL
         else:
             model_name = MODEL_NAME
     
@@ -94,7 +98,7 @@ def get_model_config_from_state(state: AgentState, temperature: Optional[float] 
 
 
 def get_llm_model(provider: Optional[str] = None, model_name: Optional[str] = None, temperature: float = 0.7):
-    """Get LLM model instance based on provider (gemini or ollama)."""
+    """Get LLM model instance based on provider (gemini, ollama, or huggingface_hub)."""
     provider = (provider or MODEL_PROVIDER).lower()
     
     if provider == "gemini":
@@ -121,19 +125,41 @@ def get_llm_model(provider: Optional[str] = None, model_name: Optional[str] = No
             logger.error(f"Failed to initialize Ollama: {e}")
             raise
     
+    elif provider == "huggingface_hub":
+        try:
+            from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
+            
+            # Step 1: Create the HuggingFaceEndpoint with text-generation task
+            # This uses the standard Hugging Face Inference API (not chat completion endpoint)
+            endpoint = HuggingFaceEndpoint(
+                repo_id=model_name or HUGGINGFACE_MODEL,
+                task="text-generation",  # IMPORTANT: Use text-generation task
+                temperature=temperature,
+                huggingfacehub_api_token=HUGGINGFACE_API_KEY if HUGGINGFACE_API_KEY else None
+            )
+            
+            # Step 2: Wrap it with ChatHuggingFace
+            return ChatHuggingFace(llm=endpoint)
+        except ImportError:
+            raise ImportError("langchain-huggingface not installed. Install with: pip install langchain-huggingface")
+        except Exception as e:
+            logger.error(f"Failed to initialize Hugging Face Hub: {e}")
+            raise
+    
     else:
-        raise ValueError(f"Unsupported provider: {provider}. Use 'gemini' or 'ollama'")
+        raise ValueError(f"Unsupported provider: {provider}. Use 'gemini', 'ollama', or 'huggingface_hub'")
 
 def get_assistant_from_state(state: AgentState, config: Optional[RunnableConfig] = None):
     """Get or create AgentConfigurationAssistant instance from state."""
     AgentConfigurationAssistant = _get_assistant_class()
     
-    # Check for existing assistant with correct model
+    # Check for existing assistant with correct model and provider
     existing = state.get("agent_config_assistant")
     model_config = get_model_config_from_state(state)
     model_name = model_config["model_name"]
+    provider = model_config["provider"]
     
-    if existing and getattr(existing, 'model_name', None) == model_name:
+    if existing and getattr(existing, 'model_name', None) == model_name and getattr(existing, 'provider', None) == provider:
         return existing
     
     # Create new assistant
@@ -141,7 +167,7 @@ def get_assistant_from_state(state: AgentState, config: Optional[RunnableConfig]
     if config and isinstance(config, dict):
         thread_id = config.get("configurable", {}).get("thread_id")
     
-    assistant = AgentConfigurationAssistant(model=model_name, thread_id=thread_id)
+    assistant = AgentConfigurationAssistant(model=model_name, provider=provider, thread_id=thread_id)
     state["agent_config_assistant"] = assistant
     return assistant
 
@@ -168,7 +194,7 @@ async def analyze_agent_requirements(agent_description: str) -> str:
     try:
         # Lazy import to avoid dependency issues at module load time
         AgentConfigurationAssistant = _get_assistant_class()
-        assistant = AgentConfigurationAssistant(model=MODEL_NAME)
+        assistant = AgentConfigurationAssistant(model=MODEL_NAME, provider=MODEL_PROVIDER)
         
         # Call the analysis method
         result = await assistant.analyze_agent_role_and_responsibility(agent_description)
@@ -1134,6 +1160,13 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> Command[Litera
         if provider == "ollama":
             # Ollama handles tools differently - bind without parallel_tool_calls
             model_with_tools = model.bind_tools(unique_tools)
+        elif provider == "huggingface_hub":
+            # Hugging Face models may have limited tool support - bind without parallel_tool_calls
+            try:
+                model_with_tools = model.bind_tools(unique_tools)
+            except Exception as e:
+                logger.warning(f"Hugging Face model may not support tools: {e}. Using model without tools.")
+                model_with_tools = model
         else:
             # Gemini and other models support parallel_tool_calls
             model_with_tools = model.bind_tools(
@@ -1204,7 +1237,17 @@ Provide clear, helpful responses and guide users through the process step by ste
             if is_connection_error and provider == "ollama":
                 response = AIMessage(content=f"Cannot connect to Ollama at {OLLAMA_BASE_URL}. Start it with: ollama serve")
             elif "api key" in error_msg.lower() or "credentials" in error_msg.lower():
-                response = AIMessage(content=f"API key error. Please check your GOOGLE_API_KEY in .env file.")
+                if provider == "gemini":
+                    response = AIMessage(content=f"API key error. Please check your GOOGLE_API_KEY in .env file.")
+                elif provider == "huggingface_hub":
+                    response = AIMessage(content=f"Hugging Face API key error. Please check your HUGGINGFACE_API_KEY in .env file. Some models require authentication.")
+                else:
+                    response = AIMessage(content=f"API key error. Please check your API key configuration.")
+            elif "403" in error_msg or "forbidden" in error_msg.lower():
+                if provider == "huggingface_hub":
+                    response = AIMessage(content=f"Hugging Face API returned 403 Forbidden. This usually means: 1) Missing or invalid HUGGINGFACE_API_KEY, 2) The model requires access request (check on huggingface.co), or 3) Rate limit exceeded. Please check your API key and model access.")
+                else:
+                    response = AIMessage(content=f"Access forbidden (403). Please check your API credentials.")
             else:
                 response = AIMessage(content=f"Error: {error_msg}")
 
@@ -1267,5 +1310,14 @@ workflow.set_entry_point("chat_node")
 
 # Use checkpointer for local FastAPI development
 # LangGraph API will ignore this checkpointer and use its own persistence when deployed
-checkpointer = MemorySaver()
-graph = workflow.compile(checkpointer=checkpointer)
+# When using LangGraphHttpAgent via add_langgraph_fastapi_endpoint, it should automatically
+# provide thread_id in the config. Set USE_CHECKPOINTER=false to disable if having issues.
+use_checkpointer = os.getenv("USE_CHECKPOINTER", "true").lower() == "true"
+
+if use_checkpointer:
+    checkpointer = MemorySaver()
+    graph = workflow.compile(checkpointer=checkpointer)
+else:
+    # Compile without checkpointer - useful if endpoint doesn't provide thread_id
+    logger.info("Compiling graph without checkpointer (USE_CHECKPOINTER=false)")
+    graph = workflow.compile()
