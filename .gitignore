@@ -10,6 +10,11 @@ node_modules/
 /.next/
 /out/
 
+# Vite
+/dist
+/dist-ssr
+*.local
+
 # Production
 /build
 
